@@ -6,18 +6,23 @@ import time
 
 
 class ReactorModel:
-    """
-    Reactor model aligned with envs.py.
+    """NMPC's internal model of the HolosGen microreactor.
 
-    Plant is always the true 8-drum HolosPK-like reactor.
+    This mirrors `envs.HolosPK` so the controller's predictions match the
+    plant. The physics (12 ODEs grouped as point-kinetics + thermal-hydraulics
+    + xenon-iodine) is identical -- any change to the reactor equations here
+    must also be made in `envs.py` and vice versa.
+
+    STATE ORDERING DIFFERS FROM envs.py (footgun):
+        envs.HolosPK:    x = [n_r, c1..c6, Tf, Tm, Tc, Xe, I]
+        ReactorModel:    x = [n_r, c1..c6, Xe, I, Tf, Tm, Tc]
+    Use the explicit unpacking in `continuous_dynamics` as the source of truth.
+
     Control interface:
-      - num_drums=1  -> single shared increment replicated to all 8 drums
-                        (matches HolosSingle.step in envs.py)
-      - num_drums=8  -> 8 independent drum increments
-                        (matches HolosMulti.step in envs.py)
-
-    State ordering kept the same as the original NMPC file:
-      x = [n_r, c1..c6, Xe, I, Tf, Tm, Tc]
+        num_drums=1  -- one shared increment replicated to all 8 physical drums
+                        (matches envs.HolosSingle.step).
+        num_drums=8  -- 8 independent drum increments
+                        (matches envs.HolosMulti.step).
     """
     def __init__(self, num_drums=1, dt=1, Ts=None):
         self.dt = dt
@@ -29,68 +34,64 @@ class ReactorModel:
         # True plant has 8 physical drums as in envs.py / HolosPK
         self.n_physical_drums = 8
 
-        # Neutronic / xenon-iodine data
-        self.sigma_Xe = 2.65e-22
-        self.yield_I = 0.061
-        self.yield_Xe = 0.002
-        self.lambda_Xe = 2.09e-5
-        self.lambda_I = 2.87e-5
-        self.Sigma_f = 0.1117
-        self.therm_n_vel = 2.19e3
-        self.neutron_lifetime = 1.68e-3
-
-        # Delayed neutron data
-        self.beta = 0.004801
-        self.betas = np.array([
-            1.42481E-04,
-            9.24281E-04,
-            7.79956E-04,
-            2.06583E-03,
-            6.71175E-04,
-            2.17806E-04,
+        # ---- Neutronics: prompt + 6 delayed-neutron groups -------------------
+        self.neutron_lifetime = 1.68e-3                 # Lambda, s
+        self.beta = 0.004801                            # total delayed fraction
+        self.betas = np.array([                         # per-group fractions
+            1.42481E-04, 9.24281E-04, 7.79956E-04,
+            2.06583E-03, 6.71175E-04, 2.17806E-04,
         ])
-        self.lambdas = np.array([
-            1.272E-02,
-            3.174E-02,
-            1.160E-01,
-            3.110E-01,
-            1.400E+00,
-            3.870E+00,
+        self.lambdas = np.array([                       # per-group decays, s^-1
+            1.272E-02, 3.174E-02, 1.160E-01,
+            3.110E-01, 1.400E+00, 3.870E+00,
         ])
+        self.Sigma_f = 0.1117                           # macroscopic fission xsec, m^-1
+        self.therm_n_vel = 2.19e3                       # thermal neutron velocity, m/s
+        self.n_0 = 2.25e13                              # steady-state n density, m^-3
+        self.P_r = 22e6                                 # rated thermal power, W
 
-        # Thermal-hydraulic data
-        self.cp_f = 977
-        self.cp_m = 1697
-        self.cp_c = 5188.6
-        self.M_f = 2002
-        self.M_m = 11573
-        self.M_c = 500
-        self.heat_f = 0.96
-        self.Tf0 = 832.4
-        self.Tm0 = 830.22
-        self.T_in = 795.47
-        self.T_out = 1106
-        self.Tc0 = 814.35
-        self.K_fm = 1.17e6
-        self.K_mc = 2.16e5
-        self.M_dot = 17.5
+        # ---- Xenon-iodine poisoning (slow, hours timescale) ------------------
+        self.sigma_Xe = 2.65e-22                        # Xe-135 microscopic xsec, m^2
+        self.yield_I = 0.061                            # I-135 fission yield
+        self.yield_Xe = 0.002                           # direct Xe-135 yield
+        self.lambda_I = 2.87e-5                         # I-135 decay, s^-1 (T1/2 ~ 6.7 h)
+        self.lambda_Xe = 2.09e-5                        # Xe-135 decay, s^-1 (T1/2 ~ 9.2 h)
 
-        # Reactivity coefficients
-        self.alpha_f = -2.875e-5
-        self.alpha_m = -3.696e-5
-        self.alpha_c = 0.0
+        # ---- Thermal-hydraulics: 3-node lumped (fuel / moderator / coolant) -
+        # Heat-flow chain: fission heat -> Tf -> Tm -> Tc -> flow out.
+        self.cp_f = 977                                 # J/(kg.K), fuel
+        self.cp_m = 1697                                # J/(kg.K), moderator
+        self.cp_c = 5188.6                              # J/(kg.K), coolant
+        self.M_f = 2002                                 # kg, fuel mass
+        self.M_m = 11573                                # kg, moderator mass
+        self.M_c = 500                                  # kg, in-core coolant
+        self.K_fm = 1.17e6                              # W/K, fuel<->moderator conductance
+        self.K_mc = 2.16e5                              # W/K, moderator<->coolant conductance
+        self.M_dot = 17.5                               # kg/s, coolant flow
+        self.heat_f = 0.96                              # fission heat fraction in fuel ('q')
 
-        # Neutron density / power scaling
-        self.n_0 = 2.25e13
-        self.P_r = 22e6
+        # Steady-state temperatures, RE-DERIVED after fixing the dTf/dt bug
+        # below (previous code used (Tf - Tc) which broke energy conservation
+        # between fuel and moderator -- see comment in `continuous_dynamics`).
+        # MUST stay in sync with envs.HolosPK.Tf0 / Tm0 / Tc0.
+        self.Tf0 = 1036.5178                            # K, fuel
+        self.Tm0 = 1018.4666                            # K, moderator
+        self.Tc0 = 916.6147                             # K, coolant (lumped)
+        self.T_in = 795.47                              # K, inlet (boundary)
+        self.T_out = 1037.7594                          # K, implied outlet (informational)
 
-        # Drum parameters (per drum, matching envs.py)
-        self.u0 = 77.8
-        self.rho_max = 0.00510
+        # ---- Reactivity feedback coefficients --------------------------------
+        self.alpha_f = -2.875e-5                        # Doppler (fuel), 1/K
+        self.alpha_m = -3.696e-5                        # moderator, 1/K
+        self.alpha_c = 0.0                              # coolant (unused), 1/K
+
+        # ---- Drum parameters (per physical drum) -----------------------------
+        self.u0 = 77.8                                  # steady-state full-power angle, deg
+        self.rho_max = 0.00510                          # max reactivity per drum, 510 pcm
         self.rho_ss = self.rho_max * (1 - np.cos(np.deg2rad(self.u0))) / 2.0
         assert self.rho_ss < self.rho_max
 
-        # Steady-state Xe & I
+        # ---- Steady-state Xe & I (from dI/dt = dXe/dt = 0 at n_r = 1) -------
         self.I0 = self.yield_I * self.Sigma_f * self.therm_n_vel * self.n_0 / self.lambda_I
         self.Xe0 = (
             self.yield_Xe * self.Sigma_f * self.therm_n_vel * self.n_0
@@ -139,6 +140,20 @@ class ReactorModel:
         return float(np.sum(self.rho_max * (1 - np.cos(np.deg2rad(drum_angles_deg))) / 2.0 - self.rho_ss))
 
     def continuous_dynamics(self, x: np.ndarray, drum_angles_deg) -> np.ndarray:
+        """Right-hand side of the 12-state ODE used by the NMPC predictor.
+
+        State x = [n_r, c1..c6, Xe, I, Tf, Tm, Tc]. Note that the ordering
+        differs from envs.HolosPK -- see the class docstring.
+
+        Three physical subsystems on three timescales:
+            * Point kinetics (ms-s): neutron population and 6 delayed groups.
+            * Thermal-hydraulics (s): fission heat -> Tf -> Tm -> Tc -> flow.
+            * Xenon-iodine poisoning (hours): I-135 decays into Xe-135, which
+              absorbs neutrons.
+
+        The rho calculation matches envs.HolosPK.calc_reactivity exactly, with
+        an extra numerical clip below for optimizer stability.
+        """
         n_r, c1, c2, c3, c4, c5, c6, Xe, I, Tf, Tm, Tc = x
 
         rho_drum = self._drum_reactivity(drum_angles_deg)
@@ -149,17 +164,34 @@ class ReactorModel:
             - self.sigma_Xe * (Xe - self.Xe0) / self.Sigma_f
         )
 
-        # Numerical guard: keep prediction finite inside optimizer.
+        # Numerical safety for the L-BFGS-B optimizer: keep rho strictly below
+        # prompt-critical (rho < beta) so neutron population can't blow up on
+        # the prompt timescale during the optimizer's exploratory rollouts.
+        # The plant in envs.py has no such clip -- this is a controller-side
+        # guard only.
         rho = float(np.clip(rho, -0.05, self.beta - 1e-6))
 
         precursor_concs = np.array([c1, c2, c3, c4, c5, c6])
+
+        # ---- Point kinetics: neutron population + 6 delayed-precursor groups ----
         d_n_r = (((rho - self.beta) * n_r) + np.sum(self.betas * precursor_concs)) / self.neutron_lifetime
         d_c = self.lambdas * n_r - self.lambdas * precursor_concs
 
-        d_Tf = (self.heat_f * self.P_r * n_r - self.K_fm * (Tf - Tc)) / (self.M_f * self.cp_f)
+        # ---- Thermal-hydraulics: fission heat -> Fuel -> Moderator -> Coolant -> flow ----
+        # FIX: previously the second term of d_Tf was K_fm*(Tf - Tc), which
+        # broke energy conservation -- heat *leaving* the fuel did not match
+        # heat *entering* the moderator (which correctly uses K_fm*(Tf - Tm)
+        # below). The fuel sits inside the moderator, not the coolant, so the
+        # conduction must be through Tm. Steady-state Tf0/Tm0/Tc0 above were
+        # re-derived to be consistent with the corrected equation.
+        d_Tf = (self.heat_f * self.P_r * n_r - self.K_fm * (Tf - Tm)) / (self.M_f * self.cp_f)
         d_Tm = (((1.0 - self.heat_f) * self.P_r * n_r) + self.K_fm * (Tf - Tm) - self.K_mc * (Tm - Tc)) / (self.M_m * self.cp_m)
+        # Coolant: the factor of 2 comes from T_out = 2*Tc - T_in (lumped
+        # approximation), so flow-carried enthalpy is 2*M_dot*cp_c*(Tc - T_in).
         d_Tc = (self.K_mc * (Tm - Tc) - 2.0 * self.M_dot * self.cp_c * (Tc - self.T_in)) / (self.M_c * self.cp_c)
 
+        # ---- Xenon-iodine poisoning ------------------------------------------
+        # phi (thermal flux) = therm_n_vel * n_0 * n_r since n_r is normalized.
         n_rate_density = self.therm_n_vel * self.n_0 * n_r
         d_I = self.yield_I * self.Sigma_f * n_rate_density - self.lambda_I * I
         d_Xe = (
