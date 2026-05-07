@@ -1,6 +1,8 @@
 import numpy as np
 from scipy.interpolate import interp1d
 
+from . import holos_constants as _c
+
 
 class HolosPK:
     """Point-kinetics + thermal-hydraulics + xenon model of the HolosGen
@@ -21,87 +23,59 @@ class HolosPK:
     power is the dimensionless n_r (1.0 == rated 22 MW). See `calc_reactivity`
     for how drums and feedbacks combine into the reactivity rho.
 
-    Parameter values mostly follow Choi 2020 (Table 2) for the Holos-Quad
-    microreactor.
+    All physical constants are sourced from `envs.holos_constants` so the
+    plant and the NMPC controller's internal model can't drift apart.
     """
 
-    ###########################################################################
-    # Neutronics: prompt + 6 delayed-neutron groups
-    ###########################################################################
-    neutron_lifetime = 1.68e-3        # Lambda, s
-    beta = 0.004801                   # total delayed-neutron fraction
-    betas = np.array([                # per-group delayed-neutron fractions
-        1.42481E-04, 9.24281E-04, 7.79956E-04,
-        2.06583E-03, 6.71175E-04, 2.17806E-04,
-    ])
-    lambdas = np.array([              # per-group precursor decay constants, s^-1
-        1.272E-02, 3.174E-02, 1.160E-01,
-        3.110E-01, 1.400E+00, 3.870E+00,
-    ])
-    Sigma_f = 0.1117                  # macroscopic fission xsec, m^-1 (Choi 2020 Fig.15c)
-    therm_n_vel = 2.19e3              # thermal neutron velocity, m/s (~0.025 eV)
-    n_0 = 2.25e13                     # steady-state neutron number density, m^-3
-    P_r = 22e6                        # rated thermal power, W
+    # Neutronics
+    neutron_lifetime = _c.neutron_lifetime
+    beta = _c.beta
+    betas = _c.betas
+    lambdas = _c.lambdas
+    Sigma_f = _c.Sigma_f
+    therm_n_vel = _c.therm_n_vel
+    n_0 = _c.n_0
+    P_r = _c.P_r
 
-    ###########################################################################
-    # Xenon-iodine poisoning (slow, hours timescale)
-    ###########################################################################
-    sigma_Xe = 2.65e-22               # microscopic Xe-135 absorption xsec, m^2
-    yield_I = 0.061                   # I-135 fission yield
-    yield_Xe = 0.002                  # direct Xe-135 fission yield
-    lambda_I = 2.87e-5                # I-135 decay constant, s^-1 (T1/2 ~ 6.7 h)
-    lambda_Xe = 2.09e-5               # Xe-135 decay constant, s^-1 (T1/2 ~ 9.2 h)
+    # Xenon-iodine
+    sigma_Xe = _c.sigma_Xe
+    yield_I = _c.yield_I
+    yield_Xe = _c.yield_Xe
+    lambda_I = _c.lambda_I
+    lambda_Xe = _c.lambda_Xe
 
-    ###########################################################################
-    # Thermal-hydraulics: 3-node lumped model (fuel / moderator / coolant)
-    # Heat flow chain: fission heat -> Tf -> Tm -> Tc -> flow out
-    ###########################################################################
-    cp_f = 977                        # specific heat of fuel, J/(kg.K)
-    cp_m = 1697                       # specific heat of moderator, J/(kg.K)
-    cp_c = 5188.6                     # specific heat of coolant, J/(kg.K)
-    M_f = 2002                        # mass of fuel, kg
-    M_m = 11573                       # mass of moderator, kg
-    M_c = 500                         # mass of coolant (in-core inventory), kg
-    K_fm = 1.17e6                     # fuel <-> moderator thermal conductance, W/K
-    K_mc = 2.16e5                     # moderator <-> coolant thermal conductance, W/K
-    M_dot = 17.5                      # coolant mass flow rate, kg/s
-    heat_f = 0.96                     # fraction of fission heat deposited in fuel ('q' in Choi 2020)
+    # Thermal-hydraulics
+    cp_f = _c.cp_f
+    cp_m = _c.cp_m
+    cp_c = _c.cp_c
+    M_f = _c.M_f
+    M_m = _c.M_m
+    M_c = _c.M_c
+    K_fm = _c.K_fm
+    K_mc = _c.K_mc
+    M_dot = _c.M_dot
+    heat_f = _c.heat_f
 
-    # Steady-state temperatures, RE-DERIVED after fixing the dTf/dt bug below
-    # (previously this term used (Tf - Tc), which broke energy conservation
-    # between the fuel and moderator nodes; see comment in reactor_dae).
-    # With n_r = 1 and the corrected equation, dTf=dTm=dTc=0 give:
-    #   Tc0 = T_in + P_r / (2 * M_dot * cp_c)
-    #   Tm0 = Tc0 + P_r / K_mc
-    #   Tf0 = Tm0 + heat_f * P_r / K_fm
-    Tf0 = 1036.5178                   # K, fuel
-    Tm0 = 1018.4666                   # K, moderator
-    Tc0 = 916.6147                    # K, coolant (lumped, in-core)
-    T_in = 795.47                     # K, coolant inlet (boundary condition)
-    T_out = 1037.7594                 # K, implied outlet = 2*Tc0 - T_in (informational)
+    # Steady-state temperatures
+    Tf0 = _c.Tf0
+    Tm0 = _c.Tm0
+    Tc0 = _c.Tc0
+    T_in = _c.T_in
+    T_out = _c.T_out
 
-    ###########################################################################
-    # Reactivity feedbacks (material properties; reference the steady state above)
-    ###########################################################################
-    alpha_f = -2.875e-5               # fuel (Doppler) reactivity coeff, 1/K (negative = stable)
-    alpha_m = -3.696e-5               # moderator reactivity coeff, 1/K (negative = stable)
-    alpha_c = 0.0                     # coolant reactivity coeff, 1/K (unused)
+    # Reactivity feedback
+    alpha_f = _c.alpha_f
+    alpha_m = _c.alpha_m
+    alpha_c = _c.alpha_c
 
-    ###########################################################################
-    # Control drums (8 physical drums, each 0..180 deg)
-    ###########################################################################
-    u0 = 77.8                         # steady-state full-power drum angle, deg
-    rho_max = 0.00510                 # max reactivity per drum (510 pcm)
+    # Drums
+    u0 = _c.u0
+    rho_max = _c.rho_max
 
     def __init__(self):
-        # calculate steady state conditions and drum reactivity
-        self.rho_ss = self.rho_max * (1 - np.cos(np.deg2rad(self.u0))) / 2
-        assert self.rho_ss < self.rho_max, 'steady state reactivity exceeds max reactivity'
-        self.I0 = self.yield_I * self.Sigma_f * self.therm_n_vel * self.n_0 / self.lambda_I
-        self.Xe0 = ((self.yield_Xe * self.Sigma_f * self.therm_n_vel * self.n_0
-                     + self.lambda_I * self.I0)
-                    / (self.lambda_Xe
-                       + self.sigma_Xe * self.therm_n_vel * self.n_0))
+        self.rho_ss = _c.rho_ss
+        self.I0 = _c.I0
+        self.Xe0 = _c.Xe0
 
     def get_initial_conditions(self):
         n_r = 1
@@ -185,7 +159,7 @@ class HolosPK:
         # heat *entering* the moderator (which correctly uses K_fm*(Tf - Tm)
         # below). The fuel sits inside the moderator, not the coolant, so the
         # conduction must be through Tm. The steady-state initial temperatures
-        # at the top of this class were re-derived to be consistent with the
+        # in `holos_constants` were re-derived to be consistent with the
         # corrected equation below.
         d_Tf = ((self.heat_f * self.P_r * n_r
                  - self.K_fm * (Tf - Tm))
