@@ -53,7 +53,12 @@ which is used to intercept PPO actions and integrate NMPC within the training lo
 ```
 .
 ├── main_hybrid.py        # Main training and evaluation script
-├── envs.py               # Reactor environments (single/multi)
+├── envs/                 # Reactor environments package
+│   ├── __init__.py       # Re-exports HolosPK, HolosMulti, HolosSingle, HolosMARL
+│   ├── holos_pk.py       # Point-kinetics + thermal-hydraulics + xenon physics
+│   ├── holos_multi.py    # Single-agent Gym env, 8-dim action (per-drum)
+│   ├── holos_single.py   # Single-agent Gym env, 1-dim action (broadcast to all drums)
+│   └── holos_marl.py     # Multi-agent PettingZoo env, 8 agents (one per drum)
 ├── nmpc.py               # NMPC control algorithm (expert policy)
 ├── on_policy_algorithm.py  # Modified SB3 file with NMPC override logic
 ├── requirements.txt      # Python dependencies (optional)
