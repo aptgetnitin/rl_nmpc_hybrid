@@ -4,19 +4,26 @@ from scipy.optimize import minimize
 from scipy.interpolate import interp1d
 import time
 
+from envs import holos_constants as _c
+
 
 class ReactorModel:
     """NMPC's internal model of the HolosGen microreactor.
 
     This mirrors `envs.HolosPK` so the controller's predictions match the
-    plant. The physics (12 ODEs grouped as point-kinetics + thermal-hydraulics
-    + xenon-iodine) is identical -- any change to the reactor equations here
-    must also be made in `envs.py` and vice versa.
+    plant. Physical constants are imported from `envs.holos_constants` (single
+    source of truth shared with HolosPK), so any change to the constants there
+    automatically propagates here. The dynamics function below still differs
+    from HolosPK in three deliberate ways:
 
-    STATE ORDERING DIFFERS FROM envs.py (footgun):
-        envs.HolosPK:    x = [n_r, c1..c6, Tf, Tm, Tc, Xe, I]
-        ReactorModel:    x = [n_r, c1..c6, Xe, I, Tf, Tm, Tc]
-    Use the explicit unpacking in `continuous_dynamics` as the source of truth.
+        1. STATE ORDERING DIFFERS (footgun):
+             envs.HolosPK:    x = [n_r, c1..c6, Tf, Tm, Tc, Xe, I]
+             ReactorModel:    x = [n_r, c1..c6, Xe, I, Tf, Tm, Tc]
+           Use the explicit unpacking in `continuous_dynamics` as the source.
+        2. Drum input shape: HolosPK takes 8 interp1d time-functions for
+           solve_ivp ramps; ReactorModel takes a static angle array per step.
+        3. Numerical safety clip on rho (controller-side only) -- see
+           `continuous_dynamics`.
 
     Control interface:
         num_drums=1  -- one shared increment replicated to all 8 physical drums
@@ -31,72 +38,53 @@ class ReactorModel:
         if self.num_drums not in (1, 8):
             raise ValueError("num_drums must be 1 or 8 to align with envs.py")
 
-        # True plant has 8 physical drums as in envs.py / HolosPK
+        # True plant has 8 physical drums as in envs.HolosPK
         self.n_physical_drums = 8
 
-        # ---- Neutronics: prompt + 6 delayed-neutron groups -------------------
-        self.neutron_lifetime = 1.68e-3                 # Lambda, s
-        self.beta = 0.004801                            # total delayed fraction
-        self.betas = np.array([                         # per-group fractions
-            1.42481E-04, 9.24281E-04, 7.79956E-04,
-            2.06583E-03, 6.71175E-04, 2.17806E-04,
-        ])
-        self.lambdas = np.array([                       # per-group decays, s^-1
-            1.272E-02, 3.174E-02, 1.160E-01,
-            3.110E-01, 1.400E+00, 3.870E+00,
-        ])
-        self.Sigma_f = 0.1117                           # macroscopic fission xsec, m^-1
-        self.therm_n_vel = 2.19e3                       # thermal neutron velocity, m/s
-        self.n_0 = 2.25e13                              # steady-state n density, m^-3
-        self.P_r = 22e6                                 # rated thermal power, W
+        # All physical constants come from envs.holos_constants. This is the
+        # only place ReactorModel takes them on; the dynamics code below uses
+        # `self.X` exactly as before.
+        self.neutron_lifetime = _c.neutron_lifetime
+        self.beta = _c.beta
+        self.betas = _c.betas
+        self.lambdas = _c.lambdas
+        self.Sigma_f = _c.Sigma_f
+        self.therm_n_vel = _c.therm_n_vel
+        self.n_0 = _c.n_0
+        self.P_r = _c.P_r
 
-        # ---- Xenon-iodine poisoning (slow, hours timescale) ------------------
-        self.sigma_Xe = 2.65e-22                        # Xe-135 microscopic xsec, m^2
-        self.yield_I = 0.061                            # I-135 fission yield
-        self.yield_Xe = 0.002                           # direct Xe-135 yield
-        self.lambda_I = 2.87e-5                         # I-135 decay, s^-1 (T1/2 ~ 6.7 h)
-        self.lambda_Xe = 2.09e-5                        # Xe-135 decay, s^-1 (T1/2 ~ 9.2 h)
+        self.sigma_Xe = _c.sigma_Xe
+        self.yield_I = _c.yield_I
+        self.yield_Xe = _c.yield_Xe
+        self.lambda_I = _c.lambda_I
+        self.lambda_Xe = _c.lambda_Xe
 
-        # ---- Thermal-hydraulics: 3-node lumped (fuel / moderator / coolant) -
-        # Heat-flow chain: fission heat -> Tf -> Tm -> Tc -> flow out.
-        self.cp_f = 977                                 # J/(kg.K), fuel
-        self.cp_m = 1697                                # J/(kg.K), moderator
-        self.cp_c = 5188.6                              # J/(kg.K), coolant
-        self.M_f = 2002                                 # kg, fuel mass
-        self.M_m = 11573                                # kg, moderator mass
-        self.M_c = 500                                  # kg, in-core coolant
-        self.K_fm = 1.17e6                              # W/K, fuel<->moderator conductance
-        self.K_mc = 2.16e5                              # W/K, moderator<->coolant conductance
-        self.M_dot = 17.5                               # kg/s, coolant flow
-        self.heat_f = 0.96                              # fission heat fraction in fuel ('q')
+        self.cp_f = _c.cp_f
+        self.cp_m = _c.cp_m
+        self.cp_c = _c.cp_c
+        self.M_f = _c.M_f
+        self.M_m = _c.M_m
+        self.M_c = _c.M_c
+        self.K_fm = _c.K_fm
+        self.K_mc = _c.K_mc
+        self.M_dot = _c.M_dot
+        self.heat_f = _c.heat_f
 
-        # Steady-state temperatures, RE-DERIVED after fixing the dTf/dt bug
-        # below (previous code used (Tf - Tc) which broke energy conservation
-        # between fuel and moderator -- see comment in `continuous_dynamics`).
-        # MUST stay in sync with envs.HolosPK.Tf0 / Tm0 / Tc0.
-        self.Tf0 = 1036.5178                            # K, fuel
-        self.Tm0 = 1018.4666                            # K, moderator
-        self.Tc0 = 916.6147                             # K, coolant (lumped)
-        self.T_in = 795.47                              # K, inlet (boundary)
-        self.T_out = 1037.7594                          # K, implied outlet (informational)
+        self.Tf0 = _c.Tf0
+        self.Tm0 = _c.Tm0
+        self.Tc0 = _c.Tc0
+        self.T_in = _c.T_in
+        self.T_out = _c.T_out
 
-        # ---- Reactivity feedback coefficients --------------------------------
-        self.alpha_f = -2.875e-5                        # Doppler (fuel), 1/K
-        self.alpha_m = -3.696e-5                        # moderator, 1/K
-        self.alpha_c = 0.0                              # coolant (unused), 1/K
+        self.alpha_f = _c.alpha_f
+        self.alpha_m = _c.alpha_m
+        self.alpha_c = _c.alpha_c
 
-        # ---- Drum parameters (per physical drum) -----------------------------
-        self.u0 = 77.8                                  # steady-state full-power angle, deg
-        self.rho_max = 0.00510                          # max reactivity per drum, 510 pcm
-        self.rho_ss = self.rho_max * (1 - np.cos(np.deg2rad(self.u0))) / 2.0
-        assert self.rho_ss < self.rho_max
-
-        # ---- Steady-state Xe & I (from dI/dt = dXe/dt = 0 at n_r = 1) -------
-        self.I0 = self.yield_I * self.Sigma_f * self.therm_n_vel * self.n_0 / self.lambda_I
-        self.Xe0 = (
-            self.yield_Xe * self.Sigma_f * self.therm_n_vel * self.n_0
-            + self.lambda_I * self.I0
-        ) / (self.lambda_Xe + self.sigma_Xe * self.therm_n_vel * self.n_0)
+        self.u0 = _c.u0
+        self.rho_max = _c.rho_max
+        self.rho_ss = _c.rho_ss
+        self.I0 = _c.I0
+        self.Xe0 = _c.Xe0
 
     @property
     def control_dim(self):
